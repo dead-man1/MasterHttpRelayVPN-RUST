@@ -91,7 +91,17 @@ class MhrvVpnService : VpnService() {
         // path below MUST therefore happen after a `startForeground()`
         // call — otherwise the user-visible symptom is "the app crashes
         // the instant I tap Start". See issue #73.
-        startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+        // Issue #211: notification used to display
+        // `127.0.0.1:${listenPort + 1}` for the SOCKS5 port, which is
+        // wrong whenever socks5Port doesn't equal listenPort+1. With the
+        // default Android config (listenPort=8080, socks5Port=1081)
+        // users saw "Routing via SOCKS5 127.0.0.1:8081" but the real
+        // listener was on 1081 — so per-app SOCKS5 setup against the
+        // notification value silently failed. Pass the actual socks5Port
+        // (after the same elvis fallback used elsewhere) so the
+        // notification matches reality.
+        val notifSocks5Port = cfg.socks5Port ?: (cfg.listenPort + 1)
+        startForeground(NOTIF_ID, buildNotif(cfg.listenPort, notifSocks5Port))
 
         // Deployment ID + auth key are required for apps_script and full
         // modes — both talk to Apps Script. Only google_only (bootstrap)
@@ -424,7 +434,7 @@ class MhrvVpnService : VpnService() {
         Log.i(TAG, "onDestroy done")
     }
 
-    private fun buildNotif(proxyPort: Int): Notification {
+    private fun buildNotif(httpPort: Int, socks5Port: Int): Notification {
         val mgr = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
@@ -451,7 +461,7 @@ class MhrvVpnService : VpnService() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("mhrv-rs VPN is active")
-            .setContentText("Routing via SOCKS5 127.0.0.1:${proxyPort + 1}")
+            .setContentText("HTTP 127.0.0.1:$httpPort  ·  SOCKS5 127.0.0.1:$socks5Port")
             .setSmallIcon(android.R.drawable.presence_online)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
