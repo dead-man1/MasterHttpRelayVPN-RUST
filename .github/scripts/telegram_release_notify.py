@@ -202,81 +202,6 @@ def sha256_of(path: str) -> str:
     return h.hexdigest()
 
 
-def build_media_group_caption(files: list, version: str, repo: str) -> str:
-    """Build the single shared caption for a media-group post.
-
-    Caption shape (each file is one filename + one SHA line):
-
-        <b>mhrv-rs v1.7.1</b>
-
-        <b>mhrv-rs-linux-amd64-v1.7.1</b>
-        <code>{sha256}</code>
-
-        <b>mhrv-rs-windows-amd64-v1.7.1.exe</b>
-        <code>{sha256}</code>
-
-        ...
-
-        مخزن گیتهاب  + مطالعه راهنمای کامل فارسی:
-        https://github.com/{repo}
-
-        لینک به این نسخه:
-        https://github.com/{repo}/releases/tag/v{version}
-
-    Telegram caption hard-cap is 1024 chars. A typical 6-file release
-    fits comfortably (~860 chars); the budget check at the bottom is a
-    safety net for edge cases (longer filename suffixes, extra files).
-
-    The release-note `<blockquote>` block that the single-document path
-    renders does NOT belong here — with N files in the group the SHA
-    list eats the caption budget, and the release-note bullets move to
-    the reply-threaded changelog message instead (sent unconditionally
-    when sending a media group, since there's nowhere else for them).
-    """
-    lines: list = [f"<b>mhrv-rs v{version}</b>", ""]
-    for path in files:
-        name = os.path.basename(path)
-        sha = sha256_of(path)
-        lines.append(f"<b>{name}</b>")
-        lines.append(f"<code>{sha}</code>")
-        lines.append("")
-    lines.extend([
-        "مخزن گیتهاب  + مطالعه راهنمای کامل فارسی:",
-        f"https://github.com/{repo}",
-        "",
-        "لینک به این نسخه:",
-        f"https://github.com/{repo}/releases/tag/v{version}",
-    ])
-    caption = "\n".join(lines)
-    if len(caption) > 1024:
-        # Truncate from the SHA list — header + footer URLs must stay.
-        # In practice we never hit this with the current 4-platform
-        # release; this branch is a guard for "what if we add 5 more
-        # ABIs later" so the caller doesn't silently fail Telegram's
-        # cap rejection. Falling back to "list filenames only, drop
-        # SHAs" keeps the post useful while flagging the issue in CI.
-        print(
-            f"::warning::caption {len(caption)} chars > 1024; "
-            f"falling back to filename-only list",
-            file=sys.stderr,
-        )
-        compact: list = [f"<b>mhrv-rs v{version}</b>", ""]
-        for path in files:
-            compact.append(f"• <code>{os.path.basename(path)}</code>")
-        compact.extend([
-            "",
-            "(SHA-256 hashes truncated; see GitHub release page.)",
-            "",
-            "مخزن گیتهاب:",
-            f"https://github.com/{repo}",
-            "",
-            "این نسخه:",
-            f"https://github.com/{repo}/releases/tag/v{version}",
-        ])
-        caption = "\n".join(compact)
-    return caption
-
-
 def tg_request(method: str, token: str, *, body: bytes, content_type: str) -> dict:
     """POST `body` to https://api.telegram.org/bot<token>/<method>."""
     conn = http.client.HTTPSConnection(
@@ -299,30 +224,10 @@ def tg_request(method: str, token: str, *, body: bytes, content_type: str) -> di
     return data["result"]
 
 
-def _content_type_for(path: str) -> str:
-    """Pick a sensible Content-Type so Telegram clients label the file
-    with the right icon/extension hint. APKs get the Android-specific
-    MIME so the channel preview shows the Android package icon; raw
-    desktop binaries (Mach-O / ELF / PE) and tarballs fall through to
-    octet-stream — Telegram still displays them with the user-supplied
-    filename and downloads correctly.
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".apk":
-        return "application/vnd.android.package-archive"
-    return "application/octet-stream"
-
-
-def send_document(token: str, chat_id: str, file_path: str, caption: str) -> int:
-    """Upload a single file with a short HTML caption. Returns message_id.
-
-    Used for single-file releases (e.g. APK-only) and as the fallback
-    when --files is passed exactly one path. Multi-file releases go
-    through send_media_group instead — Telegram's sendDocument can only
-    upload one file per call.
-    """
+def send_document(token: str, chat_id: str, apk_path: str, caption: str) -> int:
+    """Upload the APK file with a short HTML caption. Returns message_id."""
     boundary = "----" + uuid.uuid4().hex
-    with open(file_path, "rb") as f:
+    with open(apk_path, "rb") as f:
         file_bytes = f.read()
 
     def text_field(name: str, value: str) -> bytes:
@@ -332,11 +237,13 @@ def send_document(token: str, chat_id: str, file_path: str, caption: str) -> int
             f"{value}\r\n"
         ).encode("utf-8")
 
-    def file_field(name: str, filename: str, content: bytes, content_type: str) -> bytes:
+    def file_field(name: str, filename: str, content: bytes) -> bytes:
         head = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
+            # Proper MIME type — makes the Telegram client show the APK
+            # with the Android package icon and honour its size/name.
+            f"Content-Type: application/vnd.android.package-archive\r\n\r\n"
         ).encode("utf-8")
         return head + content + b"\r\n"
 
@@ -344,12 +251,7 @@ def send_document(token: str, chat_id: str, file_path: str, caption: str) -> int
         text_field("chat_id", chat_id)
         + text_field("caption", caption)
         + text_field("parse_mode", "HTML")
-        + file_field(
-            "document",
-            os.path.basename(file_path),
-            file_bytes,
-            _content_type_for(file_path),
-        )
+        + file_field("document", os.path.basename(apk_path), file_bytes)
         + f"--{boundary}--\r\n".encode("utf-8")
     )
 
@@ -360,86 +262,6 @@ def send_document(token: str, chat_id: str, file_path: str, caption: str) -> int
         content_type=f"multipart/form-data; boundary={boundary}",
     )
     return int(result["message_id"])
-
-
-def send_media_group(
-    token: str, chat_id: str, file_paths: list, caption: str
-) -> int:
-    """Upload 2–10 files as a single Telegram media group. Returns the
-    message_id of the first message in the group (which is what any
-    threaded reply should reference).
-
-    Telegram quirks:
-      - `sendMediaGroup` accepts 2..=10 items. Zero/one is rejected;
-        eleven+ is rejected. Caller must pre-check.
-      - The `caption` field on `InputMediaDocument` is shown only when
-        attached to the FIRST item in the group — Telegram clients
-        render that caption above the document stack. Captions on
-        later items in the group are silently dropped by some clients.
-        We attach the caption to file 0 and leave the rest captionless.
-      - `media` parameter is a JSON-encoded array; each item references
-        its file via `attach://<form-data-name>`. We use `file0`,
-        `file1`, ... for clarity in case Telegram ever surfaces the
-        multipart name in error responses.
-      - The total bytes of all files in a single media group must fit
-        in Telegram's per-request limit (50 MB for bot uploads). For
-        our typical release (~6 files × ~5–15 MB each) we're well
-        under, but a future Android APK swell could hit this — caller
-        should split into multiple groups in that case.
-    """
-    if len(file_paths) < 2 or len(file_paths) > 10:
-        raise SystemExit(
-            f"send_media_group: need 2..=10 files, got {len(file_paths)}"
-        )
-
-    boundary = "----" + uuid.uuid4().hex
-
-    media_array = []
-    for i, path in enumerate(file_paths):
-        item = {"type": "document", "media": f"attach://file{i}"}
-        if i == 0:
-            # Caption on the first item only — see docstring.
-            item["caption"] = caption
-            item["parse_mode"] = "HTML"
-        media_array.append(item)
-
-    parts: list = []
-
-    def text_field(name: str, value: str) -> bytes:
-        return (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-            f"{value}\r\n"
-        ).encode("utf-8")
-
-    parts.append(text_field("chat_id", chat_id))
-    parts.append(text_field("media", json.dumps(media_array)))
-
-    for i, path in enumerate(file_paths):
-        with open(path, "rb") as f:
-            content = f.read()
-        head = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file{i}"; '
-            f'filename="{os.path.basename(path)}"\r\n'
-            f"Content-Type: {_content_type_for(path)}\r\n\r\n"
-        ).encode("utf-8")
-        parts.append(head + content + b"\r\n")
-
-    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-    body = b"".join(parts)
-
-    # sendMediaGroup returns an array of Message objects (one per item);
-    # caller reply-threading targets the first message.
-    result = tg_request(
-        "sendMediaGroup",
-        token,
-        body=body,
-        content_type=f"multipart/form-data; boundary={boundary}",
-    )
-    if not isinstance(result, list) or not result:
-        raise SystemExit(f"sendMediaGroup: unexpected response shape: {result!r}")
-    return int(result[0]["message_id"])
 
 
 def send_reply(token: str, chat_id: str, text: str, reply_to: int) -> None:
@@ -464,50 +286,26 @@ def send_reply(token: str, chat_id: str, text: str, reply_to: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    # Two ways to specify what to send:
-    #   --files <path> [--files <path> ...]   (preferred, multi-platform)
-    #     Sends the files as a single Telegram media group with one
-    #     caption listing each filename + SHA-256. The follow-up changelog
-    #     reply is automatic for media-group posts (the FA bullet block
-    #     would normally live in the caption, but the per-file SHA list
-    #     eats that budget — see build_media_group_caption docstring).
-    #   --apk <path>                          (legacy, single file)
-    #     Sends one document with the original caption layout (title +
-    #     single SHA + brief FA note + two link rows). Reply with
-    #     changelog is gated on --with-changelog as before.
-    # Exactly one of the two must be present; if --files is given multiple
-    # times we use the media-group path even if --apk is also given.
-    ap.add_argument("--apk", required=False,
-                    help="Single file to send via sendDocument (legacy). "
-                         "Prefer --files for new releases.")
-    ap.add_argument("--files", action="append", default=[],
-                    help="Path to a release file. Pass once per file; "
-                         "2..=10 files are sent as a Telegram media group "
-                         "(one caption listing all filenames + SHA-256).")
+    ap.add_argument("--apk", required=True)
     ap.add_argument("--version", required=True)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--changelog", required=True,
-                    help="Path to docs/changelog/vX.Y.Z.md; read for the "
-                         "FA brief-note in the legacy caption (--apk path) "
-                         "and for the reply-threaded changelog message.")
-    # Default for --apk path: just the APK + short caption.
-    # For --files path: the FA+EN reply is automatic since the caption is
-    # full of SHA hashes; toggle is ignored in that case.
+                    help="Path to docs/changelog/vX.Y.Z.md; only read when --with-changelog is passed.")
+    # Default: just the APK + short caption (title + SHA-256 + repo URL +
+    # release URL). The per-release Persian/English blockquote reply is
+    # opt-in via `--with-changelog` so routine releases don't flood the
+    # channel with bullet-point bodies. To re-enable for a specific tag:
+    # set the repo variable TELEGRAM_INCLUDE_CHANGELOG=true before pushing
+    # the tag (the workflow converts that into --with-changelog).
     ap.add_argument("--with-changelog", action="store_true",
-                    help="(--apk path only) Include the Persian+English "
-                         "changelog as a reply-threaded message. Ignored "
-                         "with --files: media group always replies with "
-                         "the changelog because the per-file SHA list "
-                         "leaves no caption room for the FA brief-note.")
+                    help="Include the Persian+English changelog as a reply-threaded message.")
     # Dry-run lets you verify the rendered caption locally without hitting
-    # Telegram. Useful when changing caption layout — print, eyeball, push.
+    # Telegram. Useful when changing the brief-release-note budget /
+    # truncation logic — print, eyeball, push.
     ap.add_argument("--dry-run", action="store_true",
                     help="Render the caption and print it instead of posting. "
                          "Skips token/chat_id checks.")
     args = ap.parse_args()
-
-    if not args.files and not args.apk:
-        ap.error("either --apk or --files is required")
 
     if not args.dry_run:
         token = os.environ.get("BOT_TOKEN", "")
@@ -520,64 +318,24 @@ def main() -> int:
         chat_id = ""
 
     ver = args.version
-
-    # ------------------------------------------------------------------
-    # Multi-file path (media group)
-    # ------------------------------------------------------------------
-    if args.files:
-        files = list(args.files)
-        if len(files) == 1:
-            # Telegram's sendMediaGroup rejects single-item groups, so
-            # one-file --files calls fall through to sendDocument with
-            # the same multi-file caption shape (still has the SHA list
-            # below the title). This makes --files a clean superset of
-            # --apk semantically: callers can pass 1..=10 files without
-            # branching on platform-specific build outputs.
-            caption = build_media_group_caption(files, ver, args.repo)
-            if args.dry_run:
-                print(f"--- DRY RUN: single-file caption ({len(caption)} chars) ---")
-                print(caption)
-                return 0
-            mid = send_document(token, chat_id, files[0], caption)
-            print(f"sendDocument OK, message_id={mid}")
-        else:
-            caption = build_media_group_caption(files, ver, args.repo)
-            if args.dry_run:
-                print(f"--- DRY RUN: media-group caption ({len(caption)} chars) ---")
-                print(caption)
-                print(f"--- {len(files)} files would be uploaded ---")
-                for f in files:
-                    print(f"  {os.path.basename(f)}")
-                return 0
-            mid = send_media_group(token, chat_id, files, caption)
-            print(f"sendMediaGroup OK ({len(files)} files), first message_id={mid}")
-
-        # Always reply with the changelog when sending a media group —
-        # the per-file SHA list pushed the FA bullet headlines out of
-        # the caption, so the reply is the only place they fit.
-        # Single-file --files calls also reply, which matches the
-        # multi-file behaviour and avoids surprising users who switch
-        # back and forth between 1-file and N-file releases.
-        fa, en = parse_changelog(args.changelog)
-        if not fa and not en:
-            print(f"No changelog at {args.changelog}, skipping reply.")
-            return 0
-        reply_parts: list = []
-        if fa:
-            reply_parts.append(f"<blockquote>{fa}</blockquote>")
-        if en:
-            reply_parts.append(f"<blockquote>{en}</blockquote>")
-        send_reply(token, chat_id, "\n\n".join(reply_parts), mid)
-        print("Reply OK")
-        return 0
-
-    # ------------------------------------------------------------------
-    # Single-file path (legacy --apk, kept for any caller that hasn't
-    # migrated to --files yet).
-    # ------------------------------------------------------------------
     sha = sha256_of(args.apk)
+    # Brief Persian release-note above the links. Pulled from the FA
+    # half of `docs/changelog/v<ver>.md` so each release auto-includes
+    # what's new without manual edits to this script. Truncated to fit
+    # Telegram's 1024-char caption budget alongside title + SHA + the
+    # two-link footer.
     fa_note = build_caption_release_note(args.changelog)
 
+    # Caption structure requested by the repo owner:
+    #   1. Title + SHA-256 (as before)
+    #   2. Brief Persian "what's new" note (extracted from changelog)
+    #   3. Persian preamble labelling the repo link as
+    #      "GitHub repo + full Persian guide"
+    #   4. Repo URL
+    #   5. Persian preamble labelling the release link as
+    #      "this version's release — desktop/router builds live here"
+    #   6. Release URL
+    # Keeps total well under Telegram's 1024-char caption limit.
     caption_parts = [
         f"<b>mhrv-rs Android v{ver}</b>",
         "",
@@ -618,7 +376,7 @@ def main() -> int:
         print(f"No changelog at {args.changelog}, skipping reply.")
         return 0
 
-    parts: list = []
+    parts = []
     if fa:
         parts.append(f"<blockquote>{fa}</blockquote>")
     if en:

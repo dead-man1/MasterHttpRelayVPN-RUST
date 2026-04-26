@@ -651,28 +651,16 @@ jobs:
           generate_release_notes: true
 
   # Notify the Persian-speaking Telegram channel with the CI-built
-  # binaries for macOS / Linux / Windows / Android, sent as a single
-  # media group with one caption listing each filename + SHA-256, plus
-  # a reply-threaded changelog from `docs/changelog/v<tag>.md`.
+  # Android APK + its sha256 + the per-version changelog from
+  # `docs/changelog/v<tag>.md`.
   #
   # Two Telegram API calls:
-  #   1. sendMediaGroup — N (2..=10) documents in a single grouped post.
-  #      Telegram only renders the caption attached to the FIRST item,
-  #      so we put the whole filename+SHA list there and leave the rest
-  #      captionless. Caption budget is 1024 chars; a 6-file release
-  #      sits ~860 chars (script falls back to a filename-only list
-  #      with a warning if it ever overflows).
-  #   2. sendMessage — full changelog as a reply to the first message
-  #      in the media group, Persian blockquote first then English.
-  #      Auto-sent for media-group posts since the per-file SHA list
-  #      pushes the FA brief-note out of the caption.
-  #
-  # We send the raw binaries (Mach-O / ELF / PE / APK) extracted from
-  # the per-platform archives — no .zip / .tar.gz wrappers in the
-  # channel, per the maintainer's request. macOS users wanting the
-  # gatekeeper-friendly .app bundle still grab it from the GitHub
-  # Releases page; the Telegram drop is for the "give me the binary
-  # and let me run it" path.
+  #   1. sendDocument — APK file + a short caption (Telegram caps
+  #      captions at 1024 chars, and we have bigger changelogs than
+  #      that).
+  #   2. sendMessage — full changelog as a reply to #1, Persian
+  #      quote-block first then English, same pattern as the
+  #      previous manual post. No emojis, as the user asked.
   #
   # Needs two repo secrets:
   #   TELEGRAM_BOT_TOKEN  — bot the channel admits as poster
@@ -695,163 +683,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Download every release artifact (build matrix + android job),
-      # not just the universal APK. `merge-multiple: true` flattens the
-      # per-job artifact dirs into one tree so we don't have to know
-      # the artifact names in advance.
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
-
-      # Pull the raw binary out of each per-platform archive and rename
-      # it with the version suffix so users see what they're getting at
-      # a glance in Telegram. Order in `tg-files/` doesn't matter to the
-      # Telegram client (media-group items are displayed as a stack);
-      # we sort with the find pipe at the end so the script always
-      # passes them in the same order across runs (debugging-friendly).
-      #
-      # Per-platform binary picks:
-      #   - macOS amd64 / arm64: `mhrv-rs` (CLI). Mach-O binary; users
-      #     run from Terminal. The GUI .app bundle requires the .app
-      #     directory tree (can't ship as a single file), so .app users
-      #     grab the .app.zip from GitHub Releases.
-      #   - Linux amd64 / arm64: `mhrv-rs` (CLI), GLIBC build. Most
-      #     desktop Linux users run from terminal; arm64 doesn't have
-      #     a UI binary in our matrix anyway.
-      #   - Windows amd64: `mhrv-rs.exe` CLI, plus `mhrv-rs-ui.exe` if
-      #     it built (it currently does). The UI binary is what most
-      #     Windows users want; CLI is the backup.
-      #   - Android: the universal APK (already a single file).
-      #
-      # `if [ -f ... ]` guards on every extraction — a single-platform
-      # build failure (rare but possible: the matrix has
-      # `continue-on-error: true` for mipsel-softfloat) shouldn't kill
-      # the Telegram post.
-      - name: Prepare files for Telegram media group
-        run: |
-          set -euo pipefail
-          VER="${{ inputs.version || github.ref_name }}"
-          VER="${VER#v}"
-          mkdir -p tg-files extract-tmp
-
-          # Helper: extract a named binary out of a tar.gz, rename
-          # with the version-tagged target name, copy into tg-files/.
-          # Empties extract-tmp/ between calls so cross-platform binary
-          # name collisions (everyone packages a `mhrv-rs` inside their
-          # archive) don't pick up the previous run's file.
-          extract_tar() {
-            local archive="$1" platform="$2" inner="${3:-mhrv-rs}" suffix="${4:-}"
-            if [ ! -f "$archive" ]; then
-              echo "::warning::missing $archive — skipping $platform"
-              return 0
-            fi
-            rm -rf extract-tmp/* extract-tmp/.[!.]* 2>/dev/null || true
-            tar xzf "$archive" -C extract-tmp
-            if [ ! -f "extract-tmp/$inner" ]; then
-              echo "::warning::$inner not in $archive — skipping $platform"
-              return 0
-            fi
-            cp "extract-tmp/$inner" "tg-files/mhrv-rs-${platform}-v${VER}${suffix}"
-            echo "prepared mhrv-rs-${platform}-v${VER}${suffix}"
-          }
-
-          # Same shape but for .zip archives (Windows). `unzip -o`
-          # overwrites without prompting, matching tar's behaviour.
-          extract_zip() {
-            local archive="$1" platform="$2" inner="$3" suffix="$4"
-            if [ ! -f "$archive" ]; then
-              echo "::warning::missing $archive — skipping $platform"
-              return 0
-            fi
-            rm -rf extract-tmp/* extract-tmp/.[!.]* 2>/dev/null || true
-            unzip -o "$archive" -d extract-tmp >/dev/null
-            if [ ! -f "extract-tmp/$inner" ]; then
-              echo "::warning::$inner not in $archive — skipping $platform"
-              return 0
-            fi
-            cp "extract-tmp/$inner" "tg-files/mhrv-rs-${platform}-v${VER}${suffix}"
-            echo "prepared mhrv-rs-${platform}-v${VER}${suffix}"
-          }
-
-          # Desktop CLI binaries — primary platforms only. Linux armhf,
-          # Linux musl, mipsel-softfloat are niche enough to leave on
-          # the GitHub Releases page rather than crowd the Telegram
-          # group (Telegram caps a media group at 10 items).
-          extract_tar "artifacts/mhrv-rs-linux-amd64.tar.gz"   "linux-amd64"
-          extract_tar "artifacts/mhrv-rs-linux-arm64.tar.gz"   "linux-arm64"
-          extract_tar "artifacts/mhrv-rs-macos-amd64.tar.gz"   "macos-amd64"
-          extract_tar "artifacts/mhrv-rs-macos-arm64.tar.gz"   "macos-arm64"
-
-          # Windows: ship the GUI binary since it's the typical case
-          # for Windows users; the CLI still goes up via the GitHub
-          # Releases page.
-          extract_zip "artifacts/mhrv-rs-windows-amd64.zip"    "windows-amd64-ui" "mhrv-rs-ui.exe" ".exe"
-
-          # Android universal APK is already a single file with the
-          # version baked into the name — just copy it across.
-          if [ -f "artifacts/mhrv-rs-android-universal-v${VER}.apk" ]; then
-            cp "artifacts/mhrv-rs-android-universal-v${VER}.apk" tg-files/
-            echo "prepared mhrv-rs-android-universal-v${VER}.apk"
-          else
-            echo "::warning::missing universal APK — skipping Android"
-          fi
-
-          echo "--- tg-files/ ---"
-          ls -la tg-files/
-          count=$(find tg-files -maxdepth 1 -type f | wc -l)
-          if [ "$count" -lt 1 ]; then
-            echo "::error::no files prepared for Telegram post"
-            exit 1
-          fi
-          if [ "$count" -gt 10 ]; then
-            echo "::error::Telegram media group caps at 10 items, got $count"
-            exit 1
-          fi
+          name: mhrv-rs-android-universal
+          path: apk
 
       - name: Post to Telegram
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INCLUDE_CHANGELOG: ${{ vars.TELEGRAM_INCLUDE_CHANGELOG }}
         # Python over curl/bash so we don't have to fight curl's -F
         # value-interpretation rules. curl treats `-F "caption=<..."`
         # as "read the caption from file named ..." when the value
         # starts with `<`, which matches our `<b>` HTML-bold tags and
         # silently turns the whole job into a "file not found" exit
         # 26. Python stdlib has no such wart.
-        #
-        # We pass --files once per file in tg-files/. The script
-        # decides between sendMediaGroup (>=2 files) and sendDocument
-        # (==1 file) automatically; the changelog reply is always sent
-        # in the --files path because the per-file SHA list eats the
-        # caption budget that previously held the FA brief-note.
         run: |
           set -euo pipefail
           VER="${{ inputs.version || github.ref_name }}"
           VER="${VER#v}"
+          APK="apk/mhrv-rs-android-universal-v${VER}.apk"
 
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "::notice::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping Telegram post"
             exit 0
           fi
 
-          # Build the --files args. `find … -print0 | sort -z` sorts
-          # the filenames so the order is deterministic across runs
-          # (helps reading the channel post — same column order each
-          # release). xargs -0 is used so spaces/newlines in filenames
-          # don't break the arg list.
-          FILES_ARGS=()
-          while IFS= read -r -d '' f; do
-            FILES_ARGS+=(--files "$f")
-          done < <(find tg-files -maxdepth 1 -type f -print0 | sort -z)
-
-          if [ "${#FILES_ARGS[@]}" -eq 0 ]; then
-            echo "::error::no --files args to pass; tg-files/ is empty"
+          if [ ! -f "$APK" ]; then
+            echo "::error::expected $APK to exist; got:"
+            ls -la apk/
             exit 1
           fi
 
+          # --with-changelog is opt-in. Default post is just the APK
+          # plus a short caption with the SHA-256, repo URL, and release
+          # URL — no long body. To include the Persian/English bullets
+          # for a specific tag, set the repo variable
+          # TELEGRAM_INCLUDE_CHANGELOG=true before pushing that tag.
+          INCLUDE_CHANGELOG_FLAG=""
+          if [ "${INCLUDE_CHANGELOG:-}" = "true" ]; then
+            INCLUDE_CHANGELOG_FLAG="--with-changelog"
+          fi
           python3 .github/scripts/telegram_release_notify.py \
-            "${FILES_ARGS[@]}" \
+            --apk "$APK" \
             --version "$VER" \
             --repo "$GITHUB_REPOSITORY" \
-            --changelog "docs/changelog/v${VER}.md"
+            --changelog "docs/changelog/v${VER}.md" \
+            $INCLUDE_CHANGELOG_FLAG
