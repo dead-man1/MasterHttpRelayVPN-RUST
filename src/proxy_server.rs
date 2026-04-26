@@ -47,18 +47,18 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "youtu.be",
     "youtube-nocookie.com",
     "ytimg.com",
-    // YouTube video CDN. Issue #275: a user reported that with
-    // `youtube_via_relay = true`, every video chunk was traversing the
-    // Apps Script relay and a single chunk timeout aborted playback —
-    // because `googlevideo.com` was not on this list, all chunks
-    // fell through to the relay path. Adding it here keeps video
-    // bytes on the direct GFE tunnel even when the relay flag is on
-    // (the YOUTUBE_RELAY_HOSTS carve-out below excludes only the API
-    // / HTML surfaces, not the CDN). The chunks are unauthenticated
-    // bytes anyway — there's no Restricted Mode logic on the CDN, so
-    // routing them through Apps Script gains nothing and costs the
-    // 6-minute Apps Script execution cap on long videos.
-    "googlevideo.com",
+    // NOTE on `googlevideo.com`: v1.7.4 (#275) added this here on the
+    // theory that video chunks should bypass the Apps Script relay.
+    // **Reverted in v1.7.6** — multiple users (#275 amirabbas117, #281
+    // mrerf) reported total YouTube breakage after v1.7.4. Root cause
+    // is that googlevideo.com is served by Google's separate "EVA"
+    // edge IPs, not the regular GFE IPs that the user's `google_ip`
+    // typically points at. SNI-rewriting `googlevideo.com:443` to a
+    // GFE IP got TLS handshake / wrong-cert errors for those users.
+    // Pre-v1.7.4 behaviour (chunks via the Apps Script relay path —
+    // slow but reliable on every GFE IP) is restored. If we ever want
+    // direct googlevideo.com routing, it needs a separate config knob
+    // that lets users specify their EVA edge IP independently.
     // Google Video Transport CDN — YouTube video chunks, Chrome
     // auto-updates, Google Play Store downloads. The single biggest
     // gap vs the upstream Python port: without these in the list
@@ -2719,13 +2719,21 @@ mod tests {
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
         assert!(should_use_sni_rewrite(
             &hosts,
-            "rr1---sn-abc.googlevideo.com",
+            "youtubei.googleapis.com",
             443,
             false
         ));
-        assert!(should_use_sni_rewrite(
+
+        // googlevideo.com is INTENTIONALLY NOT in SNI_REWRITE_SUFFIXES
+        // — see the long note at the top of the SNI list. v1.7.4 tried
+        // adding it; reverted in v1.7.6 after user reports of total
+        // YouTube breakage. If the project ever ships an EVA-edge-IP
+        // config knob, this assertion can flip. Until then, video
+        // chunks correctly fall through to the Apps Script relay path
+        // and this assertion guards against a regression.
+        assert!(!should_use_sni_rewrite(
             &hosts,
-            "youtubei.googleapis.com",
+            "rr1---sn-abc.googlevideo.com",
             443,
             false
         ));
@@ -2746,18 +2754,12 @@ mod tests {
             true
         ));
 
-        // Flag on: video / image / channel-asset CDNs STAY on SNI
-        // rewrite. The pre-#275 implementation broke playback by
-        // routing googlevideo.com through Apps Script (it wasn't even
-        // in the SNI list before #275, so it always went via relay)
-        // and routed ytimg.com through the relay too.
+        // Flag on: image / channel-asset CDNs STAY on SNI rewrite. Pre-#275
+        // ytimg.com was incorrectly carved out alongside the API surfaces.
+        // googlevideo.com still goes through the relay path (not in the
+        // SNI list at all — see note above the SNI_REWRITE_SUFFIXES
+        // entries) so the same flag-on assertion isn't applicable to it.
         assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
-        assert!(should_use_sni_rewrite(
-            &hosts,
-            "rr1---sn-abc.googlevideo.com",
-            443,
-            true
-        ));
         assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true));
 
         // Flag on: non-YouTube Google suffixes are unaffected. Note
