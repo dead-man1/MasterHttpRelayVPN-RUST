@@ -336,53 +336,80 @@ logread -e mhrv-rs -f       # تمام لاگ
 
 ## چه چیز پیاده شده و چه چیز نه
 
-این پورت روی **حالت `apps_script`** تمرکز دارد — تنها حالتی که در سال ۲۰۲۶ مقابل سانسورگر مدرن قابل اتکاست. پیاده‌شده:
+این پورت روی **حالت `apps_script`** تمرکز دارد — تنها حالتی که در سال ۲۰۲۶ مقابل سانسورگر مدرن قابل اتکاست.
 
-- [x] HTTP proxy محلی (CONNECT برای HTTPS، forwarding ساده برای HTTP)
-- [x] SOCKS5 محلی با dispatch هوشمند TLS / HTTP / TCP خام (تلگرام، xray، …)
-- [x] MITM با تولید گواهی per-domain روی پرواز با `rcgen`
-- [x] تولید CA + نصب خودکار روی مک / لینوکس / ویندوز
-- [x] نصب گواهی NSS فایرفاکس (best-effort با `certutil`)
-- [x] رلهٔ JSON Apps Script سازگار با پروتکل `Code.gs`
-- [x] connection pool (TTL ۴۵ ثانیه، حداکثر ۲۰ idle)
-- [x] رمزگشایی gzip
-- [x] چرخش بین چند اسکریپت (round-robin)
-- [x] blacklist خودکار اسکریپت‌های ناموفق روی خطای 429 / quota (cooldown ۱۰ دقیقه)
-- [x] کش پاسخ (۵۰ مگابایت، FIFO + TTL، آگاه از `Cache-Control: max-age`، heuristics برای static asset)
-- [x] coalescing درخواست‌ها: GETهای یکسان همزمان یک fetch upstream را به اشتراک می‌گذارند
-- [x] تونل‌های بازنویسی SNI (مستقیم به لبهٔ گوگل، دور زدن رله) برای `google.com`، `youtube.com`، `youtu.be`، `youtube-nocookie.com`، `fonts.googleapis.com`. دامنه‌های اضافی از فیلد `hosts` قابل تنظیم.
-- [x] هندل خودکار ریدایرکت روی رله (`/exec` → `googleusercontent.com`)
-- [x] فیلتر هدر (حذف connection-specific، brotli)
-- [x] subcommandهای `test` و `scan-ips`
-- [x] Script IDها در لاگ ماسک می‌شوند (`prefix…suffix`) تا لاگ Deployment IDها را افشا نکند
-- [x] UI دسکتاپ (egui) — کراس‌پلتفرم، بدون bundler
-- [x] چِین کردن SOCKS5 upstream (اختیاری) برای ترافیک غیر-HTTP (MTProto تلگرام، IMAP، SSH…)
-- [x] pre-warm connection pool در شروع (اولین درخواست handshake TLS به لبهٔ گوگل را skip می‌کند)
-- [x] چرخش SNI per-connection بین `{www, mail, drive, docs, calendar}.google.com`
-- [x] dispatch موازی script-ID اختیاری (`parallel_relay`): fan-out به N اسکریپت همزمان، اولین موفقیت برمی‌گردد
-- [x] drill-down آمار per-site در UI (درخواست‌ها، نرخ کش، بایت، تأخیر متوسط per host)
-- [x] pool چرخش SNI قابل ویرایش (UI + فیلد `sni_hosts`) با probe دسترسی
-- [x] بیلدهای OpenWRT / Alpine / musl — باینری استاتیک، با اسکریپت init procd
-- [x] **Exit node** برای سایت‌های پشت Cloudflare (v1.9.4+)
-- [x] **Unwrap iframe goog.script.init** — دفاع‌در‌عمق در مقابل Deploymentهایی که پاسخ HtmlService-wrapped برمی‌گردانند (v1.9.6+)
+### پیاده‌شده
 
-عمداً پیاده **نشده**:
+| ویژگی | توضیح |
+|---|---|
+| HTTP proxy محلی | CONNECT برای HTTPS، forwarding ساده برای HTTP |
+| SOCKS5 محلی | dispatch هوشمند TLS / HTTP / TCP خام (تلگرام، xray، …) |
+| MITM | تولید گواهی per-domain روی پرواز با `rcgen` |
+| نصب CA | تولید + نصب خودکار روی مک / لینوکس / ویندوز |
+| پشتیبانی فایرفاکس | نصب گواهی NSS با `certutil` (best-effort) |
+| رلهٔ JSON | پروتکل سازگار با `Code.gs` |
+| Connection pool | TTL ۴۵ ثانیه، حداکثر ۲۰ idle |
+| رمزگشایی gzip | اتوماتیک |
+| چند اسکریپت | چرخش round-robin |
+| Blacklist خودکار | روی خطای 429 / quota، با cooldown ۱۰ دقیقه |
+| کش پاسخ | ۵۰ مگابایت، FIFO + TTL، آگاه از `Cache-Control: max-age`، heuristic برای static asset |
+| Coalescing | GETهای یکسان همزمان یک fetch upstream را به اشتراک می‌گذارند |
+| تونل بازنویسی SNI | مستقیم به لبهٔ گوگل (بدون رله) برای `google.com`، `youtube.com`، `youtu.be`، `youtube-nocookie.com`، `fonts.googleapis.com` — دامنه‌های اضافی از فیلد `hosts` |
+| هندل ریدایرکت | اتوماتیک: `/exec` → `googleusercontent.com` |
+| فیلتر هدر | حذف connection-specific و brotli |
+| Subcommand‌ها | `test` و `scan-ips` و `test-sni` |
+| ماسک Script ID | به‌صورت `prefix…suffix` در لاگ، تا Deployment ID افشا نشود |
+| UI دسکتاپ | egui — کراس‌پلتفرم، بدون bundler |
+| چِین SOCKS5 upstream | اختیاری برای ترافیک غیر-HTTP (MTProto تلگرام، IMAP، SSH …) |
+| Pre-warm pool | اولین درخواست TLS handshake به لبهٔ گوگل را skip می‌کند |
+| چرخش SNI per-connection | بین `{www, mail, drive, docs, calendar}.google.com` |
+| Parallel relay | اختیاری: fan-out به N اسکریپت همزمان، اولین موفقیت برمی‌گردد |
+| Drill-down آمار per-site | در UI: درخواست‌ها، نرخ کش، بایت، تأخیر متوسط هر host |
+| ویرایشگر pool SNI | UI + فیلد `sni_hosts` با probe دسترسی |
+| بیلد musl | OpenWRT / Alpine / محیط‌های بدون libc — باینری استاتیک، با procd init |
+| **Exit node** | برای سایت‌های پشت Cloudflare (v1.9.4+) |
+| **Unwrap goog.script.init** | دفاع‌در‌عمق در مقابل Deploymentهایی که پاسخ HtmlService-wrapped می‌فرستند (v1.9.6+) |
 
-- **HTTP/2 multiplexing** — state machine کریت `h2` (stream IDs، flow control، GOAWAY) موارد hang ظریف زیادی دارد؛ coalescing + pool ۲۰-conn بیشتر فایده را می‌گیرد.
-- **batch درخواست (`q:[...]` در حالت apps_script)** — connection pool + tokio async از قبل خوب موازی‌سازی می‌کند؛ batch ~۲۰۰ خط مدیریت state اضافه می‌کند با سود نامشخص.
-- **دانلود موازی Range-based** — edge case‌های واقعی (سرورهای بدون Range، chunked وسط stream)؛ ویدیوی یوتیوب از قبل با تونل بازنویسی SNI Apps Script را دور می‌زند.
-- **حالت‌های دیگر** (`domain_fronting`، `google_fronting`، `custom_domain`) — Cloudflare در ۲۰۲۴ domain fronting عمومی را کشت؛ Cloud Run پلن پولی می‌خواهد.
+### عمداً پیاده نشده
+
+| ویژگی | چرا نه |
+|---|---|
+| HTTP/2 multiplexing | state machine کریت `h2` (stream IDs، flow control، GOAWAY) موارد hang ظریف زیادی دارد؛ coalescing + pool ۲۰-conn بیشتر فایده را می‌گیرد |
+| Batch (`q:[...]` در apps_script) | connection pool + tokio async از قبل خوب موازی‌سازی می‌کند؛ batch ~۲۰۰ خط مدیریت state اضافه می‌کند با سود نامشخص |
+| Range-based parallel download | edge case‌های واقعی (سرورهای بدون Range، chunked وسط stream)؛ ویدیوی یوتیوب از قبل با تونل بازنویسی SNI، Apps Script را دور می‌زند |
+| حالت‌های `domain_fronting` / `google_fronting` / `custom_domain` | Cloudflare در ۲۰۲۴ domain fronting عمومی را کشت؛ Cloud Run پلن پولی می‌خواهد |
 
 ## محدودیت‌های شناخته‌شده
 
 این محدودیت‌ها ذاتی روش Apps Script + domain fronting هستند، نه باگ این کلاینت. نسخهٔ پایتون اصلی هم همین مشکلات را دارد.
 
-- **User-Agent ثابت روی `Google-Apps-Script`** برای ترافیک از رله. `UrlFetchApp.fetch()` اجازهٔ override نمی‌دهد. سایت‌هایی که bot detect می‌کنند (جست‌وجوی گوگل، بعضی CAPTCHAها) نسخهٔ no-JS برمی‌گردانند. راه‌حل: دامنه را به `hosts` اضافه کن تا از تونل بازنویسی SNI با UA واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` پیش‌فرض داخل‌اند.
-- **پخش ویدیو کند و quota-محدود** برای هرچیزی که از رله رد می‌شود. HTML یوتیوب سریع می‌آید (تونل بازنویسی SNI)، اما chunkهای `googlevideo.com` از Apps Script. سهمیهٔ رایگان: ~۲۰ هزار `UrlFetchApp` در روز، سقف بدنهٔ ۵۰ مگابایت per fetch. برای مرور متنی خوب، برای ۱۰۸۰p دردناک. چند `script_id` بچرخان برای هد رومبیش‌تر، یا VPN واقعی برای ویدیو.
-- **Brotli حذف می‌شود** از `Accept-Encoding` هدر. Apps Script gzip را decompress می‌کند ولی `br` نه؛ forward کردن `br` پاسخ را خراب می‌کند. سربار حجمی جزئی.
-- **WebSocket کار نمی‌کند** از رله — این رله request/response JSON است. سایت‌هایی که به WS upgrade می‌کنند fail می‌شوند (streaming ChatGPT، صدای Discord، …).
-- **سایت‌های HSTS-preloaded / hard-pinned** گواهی MITM را قبول نمی‌کنند. اکثر سایت‌ها مشکل ندارند؛ تعداد کمی دارند.
-- **2FA و ورود حساس گوگل / یوتیوب** ممکن است هشدار «دستگاه ناشناس» بدهد چون درخواست‌ها از IPهای Apps Script گوگل می‌آیند نه IP تو. یک‌بار از تونل وارد شو (`google.com` در لیست بازنویسی است) تا این مشکل برطرف شود.
+### User-Agent ثابت روی `Google-Apps-Script`
+
+برای ترافیکی که از رله رد می‌شود، `UrlFetchApp.fetch()` اجازهٔ override کردن User-Agent را نمی‌دهد. سایت‌هایی که bot detect می‌کنند (جست‌وجوی گوگل، بعضی CAPTCHAها) نسخهٔ no-JS برمی‌گردانند.
+
+**راه‌حل:** دامنه را به فیلد `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. این دامنه‌ها پیش‌فرض داخل‌اند: `google.com`، `youtube.com`، `fonts.googleapis.com`.
+
+### پخش ویدیو کند و quota-محدود
+
+HTML یوتیوب سریع می‌آید (از تونل بازنویسی SNI)، اما chunkهای ویدیو از `googlevideo.com` از Apps Script رد می‌شوند. سهمیهٔ رایگان: ~۲۰٬۰۰۰ `UrlFetchApp` در روز، سقف بدنهٔ ۵۰ مگابایت per fetch.
+
+برای مرور متنی خوب است، برای ۱۰۸۰p دردناک. چند `script_id` بچرخان برای هد روم بیشتر، یا VPN واقعی برای ویدیو.
+
+### Brotli حذف می‌شود
+
+از هدر `Accept-Encoding` ‏`br` حذف می‌شود. Apps Script gzip را decompress می‌کند ولی Brotli نه؛ forward کردن `br` پاسخ را خراب می‌کند. سربار حجمی جزئی.
+
+### WebSocket کار نمی‌کند
+
+این رله request/response JSON است. سایت‌هایی که به WebSocket upgrade می‌کنند fail می‌شوند (streaming ChatGPT، صدای Discord، …).
+
+### سایت‌های HSTS-preloaded / hard-pinned
+
+گواهی MITM را قبول نمی‌کنند. اکثر سایت‌ها مشکل ندارند؛ تعداد کمی هستند.
+
+### هشدار «دستگاه ناشناس» در ورود حساس گوگل
+
+2FA و ورودهای حساس گوگل / یوتیوب ممکن است هشدار «دستگاه ناشناس» بدهند، چون درخواست‌ها از IPهای Apps Script گوگل می‌آیند نه IP تو. یک‌بار از تونل وارد شو تا این مشکل برطرف شود (دامنهٔ `google.com` در لیست بازنویسی SNI است، پس از همان IP که قبلاً ورود کرده‌ای می‌رود).
 
 ## امنیت
 
