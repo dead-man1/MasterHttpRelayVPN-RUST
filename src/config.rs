@@ -112,6 +112,13 @@ pub struct Config {
     /// Hard cap on total coalesce wait (ms). 0 = use compiled default (1000ms).
     #[serde(default)]
     pub coalesce_max_ms: u16,
+    /// Adaptive coalescing preset. One of "auto" (default), "fast", or "slow".
+    /// "auto" measures batch RTT and switches automatically.
+    /// "fast" uses 50ms/300ms windows — best for broadband/fiber.
+    /// "slow" uses 150ms/600ms windows — best for slow links (Iran cable, mobile).
+    /// Leave unset or set to "auto" for automatic detection.
+    #[serde(default)]
+    pub network_preset: Option<String>,
     /// Optional explicit SNI rotation pool for outbound TLS to `google_ip`.
     /// Empty / missing = auto-expand from `front_domain` (current default of
     /// {www, mail, drive, docs, calendar}.google.com). Set to an explicit list
@@ -426,6 +433,20 @@ pub struct Config {
     /// Default 500.
     #[serde(default = "default_quota_safety_buffer")]
     pub quota_safety_buffer: u64,
+
+    /// Strip CDN noise headers from relay responses before forwarding to
+    /// the browser. Headers such as `report-to`, `nel`, `alt-svc`, and
+    /// `server-timing` are attached by modern CDNs (Cloudflare, AWS,
+    /// Fastly) and add 400–700 bytes per response for no benefit through
+    /// a MITM relay — the proxy ignores them and the browser never reads
+    /// them. Default `true`. Set to `false` to pass all headers through.
+    ///
+    /// Note: `Code.gs` has a separate `STRIP_NOISE_RESPONSE_HEADERS`
+    /// constant (default `false`) that strips at the GAS side before the
+    /// JSON reaches Rust. To see fully raw headers in the browser, both
+    /// this field and the Code.gs constant must be `false`.
+    #[serde(default = "default_strip_noise_response_headers")]
+    pub strip_noise_response_headers: bool,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -556,6 +577,7 @@ fn default_auto_blacklist_window_secs() -> u64 { 30 }
 fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
 fn default_quota_daily_limit() -> u64 { 20_000 }
 fn default_quota_safety_buffer() -> u64 { 500 }
+fn default_strip_noise_response_headers() -> bool { true }
 
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
@@ -785,6 +807,8 @@ pub struct TomlRelay {
     #[serde(default)]
     pub coalesce_max_ms: u16,
     #[serde(default)]
+    pub network_preset: Option<String>,
+    #[serde(default)]
     pub youtube_via_relay: bool,
     #[serde(default)]
     pub normalize_x_graphql: bool,
@@ -802,6 +826,8 @@ pub struct TomlRelay {
     pub request_timeout_secs: u64,
     #[serde(default = "default_stream_timeout_secs")]
     pub stream_timeout_secs: u64,
+    #[serde(default = "default_strip_noise_response_headers")]
+    pub strip_noise_response_headers: bool,
 }
 
 /// [network] section of config.toml.
@@ -935,6 +961,7 @@ impl From<TomlConfig> for Config {
             parallel_relay: t.relay.parallel_relay,
             coalesce_step_ms: t.relay.coalesce_step_ms,
             coalesce_max_ms: t.relay.coalesce_max_ms,
+            network_preset: t.relay.network_preset,
             sni_hosts: t.network.sni_hosts,
             fetch_ips_from_api: t.scan.fetch_ips_from_api,
             max_ips_to_scan: t.scan.max_ips_to_scan,
@@ -959,6 +986,7 @@ impl From<TomlConfig> for Config {
             exit_node: t.exit_node,
             quota_daily_limit: default_quota_daily_limit(),
             quota_safety_buffer: default_quota_safety_buffer(),
+            strip_noise_response_headers: t.relay.strip_noise_response_headers,
         }
     }
 }
@@ -977,6 +1005,7 @@ impl From<&Config> for TomlConfig {
                 enable_batching: c.enable_batching,
                 coalesce_step_ms: c.coalesce_step_ms,
                 coalesce_max_ms: c.coalesce_max_ms,
+                network_preset: c.network_preset.clone(),
                 youtube_via_relay: c.youtube_via_relay,
                 normalize_x_graphql: c.normalize_x_graphql,
                 disable_padding: c.disable_padding,
@@ -986,6 +1015,7 @@ impl From<&Config> for TomlConfig {
                 auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
                 request_timeout_secs: c.request_timeout_secs,
                 stream_timeout_secs: c.stream_timeout_secs,
+                strip_noise_response_headers: c.strip_noise_response_headers,
             },
             network: TomlNetwork {
                 google_ip: c.google_ip.clone(),

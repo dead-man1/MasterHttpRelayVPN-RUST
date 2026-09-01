@@ -95,9 +95,9 @@ impl FronterError {
 }
 
 type PooledStream = TlsStream<TcpStream>;
-const POOL_TTL_SECS: u64 = 60;
+const POOL_TTL_SECS: u64 = 30;
 const POOL_MIN: usize = 8;
-const POOL_REFILL_INTERVAL_SECS: u64 = 5;
+const POOL_REFILL_INTERVAL_SECS: u64 = 2;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
@@ -118,7 +118,7 @@ const H2_CONN_TTL_SECS: u64 = 540;
 /// `h2_round_trip`. This way a slow but legitimate Apps Script call
 /// isn't cut off at an arbitrary fixed cap, and Full-mode batches can
 /// honor the user's `request_timeout_secs` setting.
-const H2_READY_TIMEOUT_SECS: u64 = 5;
+const H2_READY_TIMEOUT_SECS: u64 = 3;
 /// Default response-phase deadline used by `relay_uncoalesced` callers
 /// (the Apps-Script direct path). Sized to be just under the outer
 /// `REQUEST_TIMEOUT_SECS` (25 s) so an h2 timeout still leaves a few
@@ -147,7 +147,7 @@ const H1_OPEN_TIMEOUT_SECS: u64 = 8;
 /// containers go cold after ~5min idle and cost 1-3s on the first
 /// request to wake back up — most painful on YouTube / streaming where
 /// the first chunk after a quiet pause stalls the player.
-const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
+const H1_KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Largest response body Apps Script's `UrlFetchApp` will deliver before
 /// the script gets killed mid-execution. The hard wire ceiling is ~50 MiB;
 /// after base64 / envelope overhead and edge variance, the practical raw
@@ -413,6 +413,12 @@ pub struct DomainFronter {
     /// payloads. Mirrors `Config::disable_padding` (#391). Default false
     /// (padding active = stronger DPI defense at +25% bandwidth cost).
     disable_padding: bool,
+    /// Strip CDN noise headers (report-to, nel, alt-svc, etc.) from the
+    /// relay response before forwarding to the browser. Default true.
+    /// Mirrors `Config::strip_noise_response_headers`. Independent of the
+    /// GAS-side `STRIP_NOISE_RESPONSE_HEADERS` constant in Code.gs — both
+    /// must be false to see fully raw headers.
+    strip_noise_response_headers: bool,
     zstd_enabled: Arc<AtomicBool>,
     /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
     /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
@@ -648,6 +654,7 @@ impl DomainFronter {
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
             disable_padding: config.disable_padding,
+            strip_noise_response_headers: config.strip_noise_response_headers,
             zstd_enabled: Arc::new(AtomicBool::new(false)),
             auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
             auto_blacklist_window: Duration::from_secs(
@@ -1405,10 +1412,13 @@ impl DomainFronter {
         // `release_capacity` on every chunk for typical Apps Script
         // payloads (usually < 1 MB; range chunks are 256 KB). We still
         // release capacity in the body-read loop for safety on larger
-        // bodies.
+        // bodies. 16/32 MB windows eliminate stalls for range-parallel
+        // streaming (256 KB chunks × many streams) without adding memory
+        // overhead on idle connections (the window is just a counter until
+        // data flows).
         let (send, conn) = h2::client::Builder::new()
-            .initial_window_size(4 * 1024 * 1024)
-            .initial_connection_window_size(8 * 1024 * 1024)
+            .initial_window_size(16 * 1024 * 1024)
+            .initial_connection_window_size(32 * 1024 * 1024)
             .handshake(tls)
             .await
             .map_err(|e| OpenH2Error::Handshake(e.to_string()))?;
@@ -1626,9 +1636,15 @@ impl DomainFronter {
         // through Apps Script (where a 256 KB range chunk can take 30-90s
         // of wall-clock time) are not killed by the tighter `batch_timeout`.
         // Release flow-control credit per chunk so large responses don't
-        // stall after the initial 4 MB window.
+        // stall after the initial window.
+        // Pre-size from content-length to avoid O(log n) realloc cycles
+        // on large GAS responses (up to 40 MB).
         let stream_timeout = self.stream_timeout();
-        let mut buf: Vec<u8> = Vec::new();
+        let body_hint: usize = headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        let mut buf: Vec<u8> = Vec::with_capacity(body_hint.min(APPS_SCRIPT_BODY_MAX_BYTES as usize));
         loop {
             match tokio::time::timeout(stream_timeout, body.data()).await {
                 Ok(None) => break,
@@ -2842,7 +2858,7 @@ impl DomainFronter {
                         status, body_txt
                     )));
                 }
-                return parse_relay_json(&resp_body).map_err(|e| {
+                return parse_relay_json(&resp_body, self.strip_noise_response_headers).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if looks_like_quota_error(msg) {
                             self.blacklist_script(&script_id, msg);
@@ -2951,7 +2967,7 @@ impl DomainFronter {
                             status, body_txt
                         )));
                     }
-                    match parse_relay_json(&resp_body) {
+                    match parse_relay_json(&resp_body, self.strip_noise_response_headers) {
                         Ok(bytes) => Ok::<_, FronterError>((bytes, true)),
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
@@ -4992,8 +5008,27 @@ fn is_h2_fronting_refusal_status(status: u16) -> bool {
     status == 421
 }
 
+/// CDN metadata headers that carry no value through a MITM relay.
+/// Stripped when `strip_noise_response_headers = true` (the default).
+/// The browser never reads them through a proxy, and they add 400-700 bytes
+/// of JSON per CDN-backed response for zero benefit.
+static NOISE_RESPONSE_HEADERS: &[&str] = &[
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "alt-svc",
+    "server-timing",
+    "origin-trial",
+    "cf-ray",
+    "cf-cache-status",
+    "x-amzn-requestid",
+    "x-amzn-trace-id",
+    "x-request-id",
+    "x-correlation-id",
+];
+
 /// Parse the JSON envelope from Apps Script and build a raw HTTP response.
-fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+fn parse_relay_json(body: &[u8], strip_noise: bool) -> Result<Vec<u8>, FronterError> {
     let text = std::str::from_utf8(body)
         .map_err(|_| FronterError::BadResponse("non-utf8 json".into()))?
         .trim();
@@ -5073,6 +5108,9 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         for (k, v) in hmap {
             let lk = k.to_ascii_lowercase();
             if SKIP.contains(&lk.as_str()) {
+                continue;
+            }
+            if strip_noise && NOISE_RESPONSE_HEADERS.contains(&lk.as_str()) {
                 continue;
             }
             match v {
@@ -5896,7 +5934,7 @@ mod tests {
     #[test]
     fn parse_relay_basic_json() {
         let body = r#"{"s":200,"h":{"Content-Type":"text/plain"},"b":"SGVsbG8="}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Type: text/plain\r\n"));
@@ -6795,14 +6833,14 @@ hello";
     #[test]
     fn parse_relay_error_field() {
         let body = r#"{"e":"unauthorized"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
         assert!(matches!(err, FronterError::Relay(_)));
     }
 
     #[test]
     fn parse_relay_rejects_invalid_body_base64() {
         let body = r#"{"s":200,"b":"***not-base64***"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
         assert!(matches!(err, FronterError::BadResponse(_)));
     }
 
@@ -6861,7 +6899,7 @@ hello";
     #[test]
     fn parse_relay_array_set_cookie() {
         let body = r#"{"s":200,"h":{"Set-Cookie":["a=1","b=2"]},"b":""}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.contains("Set-Cookie: a=1\r\n"));
         assert!(s.contains("Set-Cookie: b=2\r\n"));
@@ -6929,7 +6967,7 @@ hello";
         // to fail with `key must be a string at line 2`.
         let inner_json = r#"{"s":200,"h":{},"b":""}"#;
         let wrapped = build_goog_script_init_wrapper(inner_json);
-        let raw = parse_relay_json(wrapped.as_bytes()).unwrap();
+        let raw = parse_relay_json(wrapped.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 "), "got: {}", s);
     }

@@ -220,6 +220,7 @@ pub struct ProxyServer {
     tunnel_mux: Option<Arc<TunnelMux>>,
     coalesce_step_ms: u64,
     coalesce_max_ms: u64,
+    network_preset: Option<String>,
 }
 
 pub struct RewriteCtx {
@@ -525,8 +526,9 @@ impl ProxyServer {
             mitm,
             rewrite_ctx,
             tunnel_mux: None, // initialized in run() inside the tokio runtime
-            coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 10 },
-            coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
+            coalesce_step_ms: config.coalesce_step_ms as u64,
+            coalesce_max_ms: config.coalesce_max_ms as u64,
+            network_preset: config.network_preset.clone(),
         })
     }
 
@@ -548,7 +550,7 @@ impl ProxyServer {
         // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
         if self.rewrite_ctx.mode == Mode::Full {
             if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms));
+                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms, self.network_preset.as_deref()));
             }
         }
 
@@ -1837,11 +1839,14 @@ async fn dispatch_tunnel(
     };
 
     // 3. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
-    //    client doesn't send anything within 300ms, assume server-first
+    //    client doesn't send anything within 100ms, assume server-first
     //    protocol (SMTP, POP3, FTP banner) and jump straight to plain TCP.
+    //    Reduced from 300ms: browsers deliver ClientHello within 10-50ms;
+    //    100ms still covers slow/congested links while saving 200ms per
+    //    connection setup.
     let mut peek_buf = [0u8; 8];
     let peek_n = match tokio::time::timeout(
-        std::time::Duration::from_millis(300),
+        std::time::Duration::from_millis(100),
         sock.peek(&mut peek_buf),
     )
     .await
@@ -1927,7 +1932,7 @@ async fn plain_tcp_passthrough(
     } else {
         std::time::Duration::from_secs(10)
     };
-    let upstream = if let Some(proxy) = upstream_socks5 {
+    let mut upstream = if let Some(proxy) = upstream_socks5 {
         match socks5_connect_via(proxy, target_host, port).await {
             Ok(s) => {
                 tracing::info!("tcp via upstream-socks5 {} -> {}:{}", proxy, host, port);
@@ -1970,17 +1975,12 @@ async fn plain_tcp_passthrough(
         }
     };
     let _ = upstream.set_nodelay(true);
-    let (mut ar, mut aw) = sock.split();
-    let (mut br, mut bw) = {
-        let (r, w) = upstream.into_split();
-        (r, w)
-    };
-    let t1 = tokio::io::copy(&mut ar, &mut bw);
-    let t2 = tokio::io::copy(&mut br, &mut aw);
-    tokio::select! {
-        _ = t1 => {}
-        _ = t2 => {}
-    }
+    // 64 KB buffers: on a 200ms relay RTT, 8 KB (tokio default) caps
+    // throughput at ~40 KB/s; 64 KB raises that ceiling to ~320 KB/s.
+    // copy_bidirectional_with_sizes also handles half-close correctly —
+    // unlike the previous select! pattern which could drop in-flight data
+    // when one direction closed first.
+    let _ = tokio::io::copy_bidirectional_with_sizes(&mut sock, &mut upstream, 65536, 65536).await;
 }
 
 /// Open a TCP stream to `(host, port)` through an upstream SOCKS5 proxy
@@ -2101,7 +2101,7 @@ enum HeadReadResult {
 
 async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<HeadReadResult> {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    let mut tmp = [0u8; 16384];
     loop {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
@@ -2327,7 +2327,7 @@ async fn do_sni_rewrite_tunnel_from_tcp(
             }
         }
     };
-    let inbound = match TlsAcceptor::from(server_config).accept(sock).await {
+    let mut inbound = match TlsAcceptor::from(server_config).accept(sock).await {
         Ok(t) => t,
         Err(e) => {
             tracing::debug!("inbound TLS accept failed for {}: {}", host, e);
@@ -2357,7 +2357,7 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     };
     let _ = upstream_tcp.set_nodelay(true);
 
-    let outbound = match rewrite_ctx
+    let mut outbound = match rewrite_ctx
         .tls_connector
         .connect(server_name, upstream_tcp)
         .await
@@ -2369,15 +2369,8 @@ async fn do_sni_rewrite_tunnel_from_tcp(
         }
     };
 
-    // Bridge decrypted bytes between the two TLS streams.
-    let (mut ir, mut iw) = tokio::io::split(inbound);
-    let (mut or, mut ow) = tokio::io::split(outbound);
-    let client_to_server = async { tokio::io::copy(&mut ir, &mut ow).await };
-    let server_to_client = async { tokio::io::copy(&mut or, &mut iw).await };
-    tokio::select! {
-        _ = client_to_server => {}
-        _ = server_to_client => {}
-    }
+    // Bridge decrypted bytes between the two TLS streams with 64 KB buffers.
+    let _ = tokio::io::copy_bidirectional_with_sizes(&mut inbound, &mut outbound, 65536, 65536).await;
     Ok(())
 }
 
@@ -2634,7 +2627,7 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    let mut tmp = [0u8; 16384];
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
@@ -3075,18 +3068,15 @@ async fn do_plain_http_passthrough(
     };
     let _ = upstream.set_nodelay(true);
 
-    let (mut ar, mut aw) = sock.split();
-    let (mut br, mut bw) = upstream.into_split();
+    // Write the rewritten request, then reunite the upstream halves so we
+    // can use copy_bidirectional_with_sizes for the full relay loop.
+    let (br, mut bw) = upstream.into_split();
     bw.write_all(&rewritten).await?;
     if !leftover.is_empty() {
         bw.write_all(leftover).await?;
     }
-    let t1 = tokio::io::copy(&mut ar, &mut bw);
-    let t2 = tokio::io::copy(&mut br, &mut aw);
-    tokio::select! {
-        _ = t1 => {}
-        _ = t2 => {}
-    }
+    let mut upstream = br.reunite(bw).expect("halves from the same TcpStream");
+    let _ = tokio::io::copy_bidirectional_with_sizes(&mut sock, &mut upstream, 65536, 65536).await;
     Ok(())
 }
 
@@ -3708,5 +3698,55 @@ mod tests {
             domains: vec!["x.com".into()],
         };
         assert!(FrontingGroupResolved::from_config(&bad).is_err());
+    }
+
+    /// Verifies that copy_bidirectional_with_sizes correctly relays data in
+    /// both directions. Splits each duplex into read/write halves so the
+    /// write task and read assertions can operate independently.
+    #[tokio::test(flavor = "current_thread")]
+    async fn copy_bidirectional_large_buf_roundtrip() {
+        use tokio::io::AsyncWriteExt;
+
+        // a_client <-> a_server  and  b_client <-> b_server
+        let (a_client, mut a_server) = tokio::io::duplex(128 * 1024);
+        let (b_client, mut b_server) = tokio::io::duplex(128 * 1024);
+
+        let (mut a_client_read, mut a_client_write) = tokio::io::split(a_client);
+        let (mut b_client_read, mut b_client_write) = tokio::io::split(b_client);
+
+        let payload_ab = vec![0xAAu8; 32 * 1024]; // a→b
+        let payload_ba = vec![0xBBu8; 48 * 1024]; // b→a
+
+        let pa = payload_ab.clone();
+        let pb = payload_ba.clone();
+
+        // Writer task: fills both pipes and shuts down write halves so the
+        // relay sees EOF and can propagate the shutdown to the other side.
+        let write_task = tokio::spawn(async move {
+            a_client_write.write_all(&pa).await.unwrap();
+            a_client_write.shutdown().await.unwrap();
+            b_client_write.write_all(&pb).await.unwrap();
+            b_client_write.shutdown().await.unwrap();
+        });
+
+        // Relay task: bridges a_server <-> b_server with 64 KB buffers.
+        let relay_task = tokio::spawn(async move {
+            tokio::io::copy_bidirectional_with_sizes(&mut a_server, &mut b_server, 65536, 65536)
+                .await
+                .unwrap();
+        });
+
+        write_task.await.unwrap();
+        relay_task.await.unwrap();
+
+        // After relay finishes it has propagated each shutdown to the opposite
+        // side, so both client read halves are at EOF.
+        let mut got_at_b = Vec::new();
+        b_client_read.read_to_end(&mut got_at_b).await.unwrap();
+        assert_eq!(got_at_b, payload_ab, "data written to A must arrive at B");
+
+        let mut got_at_a = Vec::new();
+        a_client_read.read_to_end(&mut got_at_a).await.unwrap();
+        assert_eq!(got_at_a, payload_ba, "data written to B must arrive at A");
     }
 }
